@@ -1,0 +1,71 @@
+{{ bos_token }}
+{%- set identity = '\nคุณคือ ปรัชญา โมเดลภาษาไทย\n' -%}
+{%- if (think is not defined ) -%}
+    {%- set think = 'auto' -%}
+{%- endif -%}
+{%- set thought_effort = '\nการใช้ความคิด: {}'.format(think)  -%}
+{%- if (messages[0]['role'] == 'command') -%}
+    {{ '<|SYSTEM|>' + identity + messages[0]['content'] + thought_effort + '<|SYSTEM|>' }}
+    {%- if (messages[1]['role'] == 'system') -%}
+        {{ '<|system>\n\n' + messages[1]['content'] + '<system|>' }}
+        {%- set loop_messages = messages[2:] -%}
+    {%- else -%}
+        {{ '<|system>\n\nคุณคือ AI ผู้ช่วย<system|>' }}
+        {%- set loop_messages = messages[1:] -%}
+    {%- endif -%}
+
+{%- elif (messages[0]['role'] == 'system') -%}
+    {{ '<|SYSTEM|>' + identity + 'ทำตามคำสั่งของ system อย่างเคร่งครัด' + thought_effort + '<|SYSTEM|>' }}
+    {{ '<|system>\n\n' + messages[0]['content'] + '<system|>' }}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {{ '<|SYSTEM|>' + identity + 'ทำตามคำสั่งของ system อย่างเคร่งครัด' + thought_effort + '<|SYSTEM|>' }}
+    {{ '<|system>\n\nคุณคือ AI ผู้ช่วย<system|>' }}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+
+{%- for message in loop_messages -%}
+    {%- set role = message['role'] -%}
+    {%- set content = message['content'] -%}
+    {%- if (role == 'user') -%}
+        {{ '<|user|>\n\n' + content }}
+    {%- elif (role == 'assistant') -%}    
+        {{ '<|assistant>\n\n' }}
+        {%- if (content is string) -%}
+            {{ content }}
+        {%- elif (content is sequence) -%}
+            {%- for c in content -%}
+                {%- if (c['type'] == 'tool_call') -%}
+                    {{ '<|tool_call>' + c['content'] + '<tool_call|>' }}
+                {%- elif (c['type'] == 'tool_resp') -%}
+                    {{ '<|tool_resp>' + c['content'] + '<tool_resp|>' }}
+                {%- endif -%}    
+            {%- endfor -%}
+        {%- endif -%}
+        {{ '<assistant|>' }}
+    {%- else -%}
+        {%- if (content is string) -%}
+            {{ '<|' + role + '>' }}
+        {%- elif (content is sequence) -%}
+            {%- for c in content -%}
+                {{ '<|' + c['type'] + '>' }}
+                {{ c['content'] }}
+                {{ '<' + c['type'] + '|>' }}
+            {%- endfor -%}
+        {%- endif -%}
+        {{ '<' + role + '|>' }}
+    {%- endif -%}    
+{%- endfor -%}
+
+{%- if (add_generation_prompt) -%}
+    {{ '<|assistant>\n\n' }}
+    {%- if (think == 'high') -%}
+        {{ '<|THINK>' }}
+    {%- elif (think == 'medium') -%}
+        {{ '<|Think>' }}
+    {%- elif (think == 'low') -%}
+        {{ '<|think>' }}
+    {%- elif (think == 'auto') -%}
+        {{ '' }}
+    {%- endif -%}
+{%- endif -%}
