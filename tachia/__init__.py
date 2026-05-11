@@ -2,17 +2,27 @@ from tachia.config import TachiaConfig
 from tachia.impl import (
     GateMLP,
     RMSNorm,
+    StandardSelfAttention,
+    StandardTransformerBlock,
+    StandardTransformerLM,
+    StandardTransformerModel,
     TachiaAttention,
     TachiaBlock,
     TachiaLM,
     TachiaModel,
     apply_rope,
     create_model,
+    create_standard_transformer,
+    selector_activation_metrics,
 )
 
 __all__ = (
     "GateMLP",
     "RMSNorm",
+    "StandardSelfAttention",
+    "StandardTransformerBlock",
+    "StandardTransformerLM",
+    "StandardTransformerModel",
     "TachiaAttention",
     "TachiaBlock",
     "TachiaConfig",
@@ -20,4 +30,6 @@ __all__ = (
     "TachiaModel",
     "apply_rope",
     "create_model",
+    "create_standard_transformer",
+    "selector_activation_metrics",
 )

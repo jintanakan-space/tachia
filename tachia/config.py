@@ -8,22 +8,22 @@ class TachiaConfig:
     """Configuration for the Tachia NNX language model."""
 
     vocab_size: int
-    max_seq_len: int
-    embed_dim: int = 256
+    embed_dim: int = 112
     num_layers: int = 4
     num_heads: int = 8
-    num_slots: int = 64
+    num_slots: int = 32
     mlp_hidden_dim: int | None = None
     eps: float = 1e-6
     rope_theta: float = 10_000.0
+    causal: bool = True
+    selector_mode: str = "sigmoid"
+    selector_temperature: float = 2.0
     tie_word_embeddings: bool = True
     use_bias: bool = False
 
     def __post_init__(self) -> None:
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
-        if self.max_seq_len <= 0:
-            raise ValueError("max_seq_len must be positive")
         if self.embed_dim <= 0:
             raise ValueError("embed_dim must be positive")
         if self.embed_dim % 2 != 0:
@@ -40,6 +40,10 @@ class TachiaConfig:
             raise ValueError("num_slots must be positive")
         if self.eps <= 0.0:
             raise ValueError("eps must be positive")
+        if self.selector_mode not in {"sigmoid", "softmax"}:
+            raise ValueError("selector_mode must be 'sigmoid' or 'softmax'")
+        if self.selector_temperature <= 0.0:
+            raise ValueError("selector_temperature must be positive")
 
     @property
     def resolved_mlp_hidden_dim(self) -> int:

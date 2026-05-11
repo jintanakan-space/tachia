@@ -19,6 +19,89 @@ def _normalize_sigmoid(logits: Array, axis: int, eps: float) -> Array:
     return weights / (jnp.sum(weights, axis=axis, keepdims=True) + eps)
 
 
+def _prefix_sigmoid_compress(logits: Array, values: Array, eps: float) -> Array:
+    weights = jax.nn.sigmoid(logits)
+    values = jnp.swapaxes(values, 1, 2)
+    weighted_values = weights[..., None] * values[:, :, None, :, :]
+    prefix_values = jnp.cumsum(weighted_values, axis=-2)
+    prefix_weights = jnp.cumsum(weights, axis=-1)[..., None]
+    compressed = prefix_values / (prefix_weights + eps)
+    return jnp.transpose(compressed, (0, 3, 2, 1, 4))
+
+
+def _full_sigmoid_compress(logits: Array, values: Array, eps: float) -> Array:
+    weights = _normalize_sigmoid(logits, axis=-1, eps=eps)
+    return jnp.einsum("bhsl,blhd->bshd", weights, values)
+
+
+def _prefix_softmax_compress(logits: Array, values: Array) -> Array:
+    length = values.shape[1]
+    causal_mask = jnp.tril(jnp.ones((length, length), dtype=bool))
+    masked_logits = jnp.where(causal_mask[None, None, None, :, :], logits[:, :, :, None, :], -jnp.inf)
+    weights = jax.nn.softmax(masked_logits, axis=-1)
+    return jnp.einsum("bhstl,blhd->btshd", weights, values)
+
+
+def _full_softmax_compress(logits: Array, values: Array) -> Array:
+    weights = jax.nn.softmax(logits, axis=-1)
+    return jnp.einsum("bhsl,blhd->bshd", weights, values)
+
+
+def _selector_weights(logits: Array, mode: str, causal: bool, eps: float) -> Array:
+    if causal:
+        length = logits.shape[-1]
+        causal_mask = jnp.tril(jnp.ones((length, length), dtype=bool))
+        masked_logits = jnp.where(
+            causal_mask[None, None, None, :, :],
+            logits[:, :, :, None, :],
+            -jnp.inf,
+        )
+        if mode == "sigmoid":
+            weights = jax.nn.sigmoid(masked_logits)
+            weights = weights * causal_mask[None, None, None, :, :]
+            weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + eps)
+            return weights
+        return jax.nn.softmax(masked_logits, axis=-1)
+
+    if mode == "sigmoid":
+        weights = _normalize_sigmoid(logits, axis=-1, eps=eps)
+    else:
+        weights = jax.nn.softmax(logits, axis=-1)
+    return weights[:, :, :, None, :]
+
+
+def selector_activation_metrics(weights: Array, eps: float = 1e-6) -> dict[str, Array]:
+    """Compute selector usage metrics from weights shaped [B, H, S, T, L]."""
+
+    entropy = -jnp.sum(weights * jnp.log(weights + eps), axis=-1)
+    effective_context = jnp.exp(entropy)
+    top_tokens = jnp.argmax(weights, axis=-1)
+
+    slots = weights.shape[2]
+    if slots < 2:
+        zero = jnp.zeros(weights.shape[:2] + weights.shape[3:4], dtype=weights.dtype)
+        return {
+            "entropy": entropy,
+            "effective_context": effective_context,
+            "top_token_overlap": zero,
+            "pairwise_selector_cosine": zero,
+        }
+
+    token_counts = jnp.sum(jax.nn.one_hot(top_tokens, weights.shape[-1], dtype=weights.dtype), axis=2)
+    top_overlap = (jnp.sum(jnp.square(token_counts), axis=-1) - slots) / (slots * (slots - 1))
+
+    normed = weights / (jnp.linalg.norm(weights, axis=-1, keepdims=True) + eps)
+    summed_normed = jnp.sum(normed, axis=2)
+    off_diagonal = (jnp.sum(jnp.square(summed_normed), axis=-1) - slots) / (slots * (slots - 1))
+
+    return {
+        "entropy": entropy,
+        "effective_context": effective_context,
+        "top_token_overlap": top_overlap,
+        "pairwise_selector_cosine": off_diagonal,
+    }
+
+
 def apply_rope(x: Array, positions: Array | None = None, theta: float = 10_000.0) -> Array:
     """Apply rotary position embeddings to the final dimension of `x`.
 
@@ -61,7 +144,7 @@ class RMSNorm(nnx.Module):
         x_f32 = x.astype(jnp.float32)
         variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
         normalized = x_f32 * jax.lax.rsqrt(variance + self.eps)
-        return (normalized * self.scale.value).astype(dtype)
+        return (normalized * self.scale[...]).astype(dtype)
 
 
 class TachiaAttention(nnx.Module):
@@ -97,21 +180,40 @@ class TachiaAttention(nnx.Module):
         *,
         positions: Array | None = None,
         deterministic: bool = True,
-    ) -> Array:
+        collect_stats: bool = False,
+    ) -> Array | tuple[Array, dict[str, dict[str, Array]]]:
         cfg = self.config
 
         q = apply_rope(self._split_heads(self.q_proj(x)), positions, cfg.rope_theta)
         selector_source = self._split_heads(x)
 
-        key_selector_logits = jnp.einsum("hds,blhd->bhsl", self.k_slots.value, selector_source)
-        key_selector = _normalize_sigmoid(key_selector_logits, axis=-1, eps=cfg.eps)
-
-        value_selector_logits = jnp.einsum("hds,blhd->bhsl", self.v_slots.value, selector_source)
-        value_selector = _normalize_sigmoid(value_selector_logits, axis=-1, eps=cfg.eps)
+        key_selector_logits = (
+            jnp.einsum("hds,blhd->bhsl", self.k_slots[...], selector_source)
+            * cfg.selector_temperature
+        )
+        value_selector_logits = (
+            jnp.einsum("hds,blhd->bhsl", self.v_slots[...], selector_source)
+            * cfg.selector_temperature
+        )
 
         k_l = apply_rope(self._split_heads(self.k_proj(x)), positions, cfg.rope_theta)
-        k_s = jnp.einsum("bhsl,blhd->bshd", key_selector, k_l)
-        v_s = jnp.einsum("bhsl,blhd->bshd", value_selector, self._split_heads(self.v_proj(x)))
+        v_l = self._split_heads(self.v_proj(x))
+
+        if cfg.causal:
+            if cfg.selector_mode == "sigmoid":
+                k_s = _prefix_sigmoid_compress(key_selector_logits, k_l, cfg.eps)
+                v_s = _prefix_sigmoid_compress(value_selector_logits, v_l, cfg.eps)
+            else:
+                k_s = _prefix_softmax_compress(key_selector_logits, k_l)
+                v_s = _prefix_softmax_compress(value_selector_logits, v_l)
+            q = q[:, :, None, :, :]
+        else:
+            if cfg.selector_mode == "sigmoid":
+                k_s = _full_sigmoid_compress(key_selector_logits, k_l, cfg.eps)
+                v_s = _full_sigmoid_compress(value_selector_logits, v_l, cfg.eps)
+            else:
+                k_s = _full_softmax_compress(key_selector_logits, k_l)
+                v_s = _full_softmax_compress(value_selector_logits, v_l)
 
         y = nnx.dot_product_attention(
             q,
@@ -120,7 +222,18 @@ class TachiaAttention(nnx.Module):
             dropout_rate=0.0,
             deterministic=True,
         )
-        return self.out_proj(self._merge_heads(y))
+        if cfg.causal:
+            y = y[:, :, 0, :, :]
+        y = self.out_proj(self._merge_heads(y))
+        if not collect_stats:
+            return y
+
+        key_weights = _selector_weights(key_selector_logits, cfg.selector_mode, cfg.causal, cfg.eps)
+        value_weights = _selector_weights(value_selector_logits, cfg.selector_mode, cfg.causal, cfg.eps)
+        return y, {
+            "key": selector_activation_metrics(key_weights, cfg.eps),
+            "value": selector_activation_metrics(value_weights, cfg.eps),
+        }
 
 
 class GateMLP(nnx.Module):
@@ -151,9 +264,24 @@ class TachiaBlock(nnx.Module):
         *,
         positions: Array | None = None,
         deterministic: bool = True,
-    ) -> Array:
-        x = x + self.attn(self.attn_norm(x), positions=positions, deterministic=deterministic)
+        collect_stats: bool = False,
+    ) -> Array | tuple[Array, dict[str, dict[str, Array]]]:
+        attn_outputs = self.attn(
+            self.attn_norm(x),
+            positions=positions,
+            deterministic=deterministic,
+            collect_stats=collect_stats,
+        )
+        if collect_stats:
+            attn_y, stats = attn_outputs
+        else:
+            attn_y = attn_outputs
+            stats = None
+
+        x = x + attn_y
         x = x + self.mlp(self.mlp_norm(x), deterministic=deterministic)
+        if collect_stats:
+            return x, stats
         return x
 
 
@@ -170,26 +298,27 @@ class TachiaModel(nnx.Module):
         *,
         positions: Array | None = None,
         deterministic: bool = True,
-    ) -> Array:
+        collect_stats: bool = False,
+    ) -> Array | tuple[Array, dict[str, dict[str, Array]]]:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [batch, length]")
-        if input_ids.shape[1] > self.config.max_seq_len:
-            raise ValueError(
-                f"sequence length {input_ids.shape[1]} exceeds max_seq_len "
-                f"{self.config.max_seq_len}"
-            )
 
         x = self.token_embedding(input_ids)
         x = x * math.sqrt(self.config.embed_dim)
-        x = call_block(
+        outputs = call_block(
             self.blocks,
             x,
             positions=positions,
             deterministic=deterministic,
+            module_kwargs={"collect_stats": collect_stats},
             in_axes=(0, nnx.Carry, None, None),
+            return_aux=collect_stats,
         )
 
-        return self.norm(x)
+        if collect_stats:
+            x, stats = outputs
+            return self.norm(x), stats
+        return self.norm(outputs)
 
 
 class TachiaLM(nnx.Module):
@@ -210,11 +339,27 @@ class TachiaLM(nnx.Module):
         *,
         positions: Array | None = None,
         deterministic: bool = True,
-    ) -> Array:
-        hidden = self.model(input_ids, positions=positions, deterministic=deterministic)
+        collect_stats: bool = False,
+    ) -> Array | tuple[Array, dict[str, dict[str, Array]]]:
+        outputs = self.model(
+            input_ids,
+            positions=positions,
+            deterministic=deterministic,
+            collect_stats=collect_stats,
+        )
+        if collect_stats:
+            hidden, stats = outputs
+        else:
+            hidden = outputs
+            stats = None
+
         if self.config.tie_word_embeddings:
-            return self.model.token_embedding.attend(hidden)
-        return self.lm_head(hidden)
+            logits = self.model.token_embedding.attend(hidden)
+        else:
+            logits = self.lm_head(hidden)
+        if collect_stats:
+            return logits, stats
+        return logits
 
     def loss(
         self,
@@ -249,11 +394,7 @@ class TachiaLM(nnx.Module):
             rng = jax.random.PRNGKey(0)
 
         for _ in range(max_new_tokens):
-            if tokens.shape[1] > self.config.max_seq_len:
-                context = tokens[:, -self.config.max_seq_len :]
-            else:
-                context = tokens
-            logits = self(context, deterministic=True)[:, -1, :] / temperature
+            logits = self(tokens, deterministic=True)[:, -1, :] / temperature
             rng, step_rng = jax.random.split(rng)
             next_token = jax.random.categorical(step_rng, logits, axis=-1)[:, None]
             tokens = jnp.concatenate([tokens, next_token], axis=1)
@@ -261,36 +402,183 @@ class TachiaLM(nnx.Module):
         return tokens
 
 
+class StandardSelfAttention(nnx.Module):
+    def __init__(self, config: TachiaConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        dim = config.embed_dim
+        self.q_proj = nnx.Linear(dim, dim, use_bias=config.use_bias, rngs=rngs)
+        self.k_proj = nnx.Linear(dim, dim, use_bias=config.use_bias, rngs=rngs)
+        self.v_proj = nnx.Linear(dim, dim, use_bias=config.use_bias, rngs=rngs)
+        self.out_proj = nnx.Linear(dim, dim, use_bias=config.use_bias, rngs=rngs)
+
+    def _split_heads(self, x: Array) -> Array:
+        batch, length, _ = x.shape
+        return x.reshape(batch, length, self.config.num_heads, -1)
+
+    def _merge_heads(self, x: Array) -> Array:
+        batch, length, _, _ = x.shape
+        return x.reshape(batch, length, self.config.embed_dim)
+
+    def __call__(
+        self,
+        x: Array,
+        *,
+        positions: Array | None = None,
+        deterministic: bool = True,
+    ) -> Array:
+        q = apply_rope(self._split_heads(self.q_proj(x)), positions, self.config.rope_theta)
+        k = apply_rope(self._split_heads(self.k_proj(x)), positions, self.config.rope_theta)
+        v = self._split_heads(self.v_proj(x))
+        y = nnx.dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_rate=0.0,
+            deterministic=True,
+            is_causal=self.config.causal,
+        )
+        return self.out_proj(self._merge_heads(y))
+
+
+class StandardTransformerBlock(nnx.Module):
+    def __init__(self, config: TachiaConfig, *, rngs: nnx.Rngs):
+        self.attn_norm = RMSNorm(config.embed_dim, eps=config.eps, rngs=rngs)
+        self.attn = StandardSelfAttention(config, rngs=rngs)
+        self.mlp_norm = RMSNorm(config.embed_dim, eps=config.eps, rngs=rngs)
+        self.mlp = GateMLP(config, rngs=rngs)
+
+    def __call__(
+        self,
+        x: Array,
+        *,
+        positions: Array | None = None,
+        deterministic: bool = True,
+    ) -> Array:
+        x = x + self.attn(self.attn_norm(x), positions=positions, deterministic=deterministic)
+        x = x + self.mlp(self.mlp_norm(x), deterministic=deterministic)
+        return x
+
+
+class StandardTransformerModel(nnx.Module):
+    def __init__(self, config: TachiaConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.token_embedding = nnx.Embed(config.vocab_size, config.embed_dim, rngs=rngs)
+        self.blocks = create_block(
+            config.num_layers,
+            StandardTransformerBlock,
+            rngs=rngs,
+            module_args=(config,),
+        )
+        self.norm = RMSNorm(config.embed_dim, eps=config.eps, rngs=rngs)
+
+    def __call__(
+        self,
+        input_ids: Array,
+        *,
+        positions: Array | None = None,
+        deterministic: bool = True,
+    ) -> Array:
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, length]")
+        x = self.token_embedding(input_ids)
+        x = x * math.sqrt(self.config.embed_dim)
+        x = call_block(
+            self.blocks,
+            x,
+            positions=positions,
+            deterministic=deterministic,
+            in_axes=(0, nnx.Carry, None, None),
+        )
+        return self.norm(x)
+
+
+class StandardTransformerLM(nnx.Module):
+    def __init__(self, config: TachiaConfig, *, rngs: nnx.Rngs):
+        self.config = config
+        self.model = StandardTransformerModel(config, rngs=rngs)
+        if not config.tie_word_embeddings:
+            self.lm_head = nnx.Linear(
+                config.embed_dim,
+                config.vocab_size,
+                use_bias=False,
+                rngs=rngs,
+            )
+
+    def __call__(
+        self,
+        input_ids: Array,
+        *,
+        positions: Array | None = None,
+        deterministic: bool = True,
+    ) -> Array:
+        hidden = self.model(input_ids, positions=positions, deterministic=deterministic)
+        if self.config.tie_word_embeddings:
+            return self.model.token_embedding.attend(hidden)
+        return self.lm_head(hidden)
+
+
 def create_model(
     *,
     vocab_size: int,
-    max_seq_len: int,
-    embed_dim: int = 256,
+    embed_dim: int = 112,
     num_layers: int = 4,
     num_heads: int = 8,
-    num_slots: int = 64,
+    num_slots: int = 32,
     mlp_hidden_dim: int | None = None,
+    causal: bool = True,
+    selector_mode: str = "sigmoid",
+    selector_temperature: float = 2.0,
     seed: int = 0,
 ) -> TachiaLM:
     config = TachiaConfig(
         vocab_size=vocab_size,
-        max_seq_len=max_seq_len,
         embed_dim=embed_dim,
         num_layers=num_layers,
         num_heads=num_heads,
         num_slots=num_slots,
         mlp_hidden_dim=mlp_hidden_dim,
+        causal=causal,
+        selector_mode=selector_mode,
+        selector_temperature=selector_temperature,
     )
     return TachiaLM(config, rngs=nnx.Rngs(seed))
+
+
+def create_standard_transformer(
+    *,
+    vocab_size: int,
+    embed_dim: int = 112,
+    num_layers: int = 4,
+    num_heads: int = 8,
+    mlp_hidden_dim: int | None = None,
+    causal: bool = True,
+    seed: int = 0,
+) -> StandardTransformerLM:
+    config = TachiaConfig(
+        vocab_size=vocab_size,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_slots=1,
+        mlp_hidden_dim=mlp_hidden_dim,
+        causal=causal,
+    )
+    return StandardTransformerLM(config, rngs=nnx.Rngs(seed))
 
 
 __all__: Sequence[str] = (
     "GateMLP",
     "RMSNorm",
+    "StandardSelfAttention",
+    "StandardTransformerBlock",
+    "StandardTransformerLM",
+    "StandardTransformerModel",
     "TachiaAttention",
     "TachiaBlock",
     "TachiaLM",
     "TachiaModel",
     "apply_rope",
     "create_model",
+    "create_standard_transformer",
+    "selector_activation_metrics",
 )
