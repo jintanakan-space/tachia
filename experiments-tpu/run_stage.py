@@ -188,6 +188,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embed-dim", type=int, default=1536)
     parser.add_argument("--layers", type=int, default=24)
     parser.add_argument("--heads", type=int, default=16)
+
+    parser.add_argument("--sharding", choices=["ddp", "no"], default="no")
     return parser.parse_args()
 
 
