@@ -72,8 +72,8 @@ def base_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
         command.extend(["--train-examples", str(args.train_examples)])
     if not args.shuffle_offsets:
         command.append("--no-shuffle-offsets")
-    if args.sharding:
-        command.append(["--sharding", str(args.sharding)])
+    if args.sharding != "no":
+        command.extend(["--sharding", str(args.sharding)])
     return command
 
 
