@@ -8,7 +8,12 @@ import numpy as np
 from flax import nnx
 
 from tachia import TachiaAttention, TachiaConfig, TachiaLM, create_model, create_standard_transformer
-from tachia.impl import _prefix_sigmoid_compress, _prefix_softmax_compress
+from tachia.impl import (
+    _causal_sigmoid_slot_attention,
+    _prefix_sigmoid_compress,
+    _prefix_softmax_compress,
+    _slot_dot_product_attention,
+)
 from train import loss_fn, slot_parameter_diversity_loss
 
 
@@ -95,6 +100,32 @@ class TachiaModelTest(unittest.TestCase):
         expected = jnp.stack(expected_steps, axis=1)
 
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    def test_slot_dot_product_attention_matches_manual_softmax(self) -> None:
+        q = jax.random.normal(jax.random.PRNGKey(0), (2, 5, 4, 6))
+        k = jax.random.normal(jax.random.PRNGKey(1), (2, 5, 3, 4, 6))
+        v = jax.random.normal(jax.random.PRNGKey(2), (2, 5, 3, 4, 6))
+
+        actual = _slot_dot_product_attention(q, k, v)
+        logits = jnp.sum(q[:, :, None, :, :] * k, axis=-1) * (q.shape[-1] ** -0.5)
+        weights = jax.nn.softmax(logits, axis=2)
+        expected = jnp.sum(weights[..., None] * v, axis=2)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+    def test_fused_causal_sigmoid_slot_attention_matches_unfused_path(self) -> None:
+        q = jax.random.normal(jax.random.PRNGKey(0), (2, 5, 4, 6))
+        k = jax.random.normal(jax.random.PRNGKey(1), (2, 5, 4, 6))
+        v = jax.random.normal(jax.random.PRNGKey(2), (2, 5, 4, 6))
+        key_logits = jax.random.normal(jax.random.PRNGKey(3), (2, 4, 3, 5))
+        value_logits = jax.random.normal(jax.random.PRNGKey(4), (2, 4, 3, 5))
+
+        actual = _causal_sigmoid_slot_attention(q, key_logits, value_logits, k, v, eps=1e-6)
+        k_slots = _prefix_sigmoid_compress(key_logits, k, eps=1e-6)
+        v_slots = _prefix_sigmoid_compress(value_logits, v, eps=1e-6)
+        expected = _slot_dot_product_attention(q, k_slots, v_slots)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
     def test_causal_outputs_do_not_change_when_future_tokens_change(self) -> None:
         config = TachiaConfig(vocab_size=64, embed_dim=16, num_layers=2, num_heads=4, num_slots=3)

@@ -47,6 +47,86 @@ def _full_softmax_compress(logits: Array, values: Array) -> Array:
     return jnp.einsum("bhsl,blhd->bshd", weights, values)
 
 
+def _slot_dot_product_attention(q: Array, k: Array, v: Array) -> Array:
+    """Attention from each token query to its compressed slots.
+
+    Shapes:
+      q: [B, T, H, D]
+      k: [B, T, S, H, D]
+      v: [B, T, S, H, D]
+
+    `nnx.dot_product_attention` treats the per-token `T` dimension as a batch
+    axis here, and XLA materializes a large broadcast shaped roughly
+    [layers, B, H, S, T, D] on TPU. The explicit einsums keep the largest
+    attention tensor at [B, T, H, S].
+    """
+
+    scale = q.shape[-1] ** -0.5
+    logits = jnp.einsum("bthd,btshd->bths", q, k) * scale
+    weights = jax.nn.softmax(logits, axis=-1)
+    return jnp.einsum("bths,btshd->bthd", weights, v)
+
+
+def _causal_sigmoid_slot_attention(
+    q: Array,
+    key_selector_logits: Array,
+    value_selector_logits: Array,
+    keys: Array,
+    values: Array,
+    eps: float,
+) -> Array:
+    """Fused causal sigmoid slot compression and attention.
+
+    This is algebraically the same as:
+      1. causal prefix sigmoid compression for K/V
+      2. attention from each token query to its prefix slots
+
+    but it scans over sequence positions and keeps only cumulative slot
+    numerators/denominators in memory.
+    """
+
+    batch, _, heads, head_dim = q.shape
+    slots = key_selector_logits.shape[2]
+    dtype = q.dtype
+
+    q_time = jnp.swapaxes(q, 0, 1)
+    key_time = jnp.swapaxes(keys, 0, 1)
+    value_time = jnp.swapaxes(values, 0, 1)
+    key_logits_time = jnp.moveaxis(key_selector_logits, -1, 0)
+    value_logits_time = jnp.moveaxis(value_selector_logits, -1, 0)
+
+    zeros_num = jnp.zeros((batch, heads, slots, head_dim), dtype=dtype)
+    zeros_den = jnp.zeros((batch, heads, slots), dtype=dtype)
+    init = (zeros_num, zeros_den, zeros_num, zeros_den)
+    scale = head_dim**-0.5
+
+    def step(carry, inputs):
+        key_num, key_den, value_num, value_den = carry
+        q_t, key_t, value_t, key_logits_t, value_logits_t = inputs
+
+        key_weights_t = jax.nn.sigmoid(key_logits_t).astype(dtype)
+        value_weights_t = jax.nn.sigmoid(value_logits_t).astype(dtype)
+
+        key_num = key_num + key_weights_t[..., None] * key_t[:, :, None, :]
+        key_den = key_den + key_weights_t
+        value_num = value_num + value_weights_t[..., None] * value_t[:, :, None, :]
+        value_den = value_den + value_weights_t
+
+        key_slots = key_num / (key_den[..., None] + eps)
+        value_slots = value_num / (value_den[..., None] + eps)
+        logits = jnp.einsum("bhd,bhsd->bhs", q_t, key_slots) * scale
+        weights = jax.nn.softmax(logits, axis=-1)
+        y_t = jnp.einsum("bhs,bhsd->bhd", weights, value_slots)
+        return (key_num, key_den, value_num, value_den), y_t
+
+    _, y_time = jax.lax.scan(
+        step,
+        init,
+        (q_time, key_time, value_time, key_logits_time, value_logits_time),
+    )
+    return jnp.swapaxes(y_time, 0, 1)
+
+
 def _selector_weights(logits: Array, mode: str, causal: bool, eps: float) -> Array:
     if causal:
         length = logits.shape[-1]
@@ -199,14 +279,23 @@ class TachiaAttention(nnx.Module):
         k_l = apply_rope(self._split_heads(self.k_proj(x)), positions, cfg.rope_theta)
         v_l = self._split_heads(self.v_proj(x))
 
-        if cfg.causal:
+        if cfg.causal and cfg.selector_mode == "sigmoid" and not collect_stats:
+            y = _causal_sigmoid_slot_attention(
+                q,
+                key_selector_logits,
+                value_selector_logits,
+                k_l,
+                v_l,
+                cfg.eps,
+            )
+        elif cfg.causal:
             if cfg.selector_mode == "sigmoid":
                 k_s = _prefix_sigmoid_compress(key_selector_logits, k_l, cfg.eps)
                 v_s = _prefix_sigmoid_compress(value_selector_logits, v_l, cfg.eps)
             else:
                 k_s = _prefix_softmax_compress(key_selector_logits, k_l)
                 v_s = _prefix_softmax_compress(value_selector_logits, v_l)
-            q = q[:, :, None, :, :]
+            y = _slot_dot_product_attention(q, k_s, v_s)
         else:
             if cfg.selector_mode == "sigmoid":
                 k_s = _full_sigmoid_compress(key_selector_logits, k_l, cfg.eps)
@@ -214,16 +303,9 @@ class TachiaAttention(nnx.Module):
             else:
                 k_s = _full_softmax_compress(key_selector_logits, k_l)
                 v_s = _full_softmax_compress(value_selector_logits, v_l)
-
-        y = nnx.dot_product_attention(
-            q,
-            k_s,
-            v_s,
-            dropout_rate=0.0,
-            deterministic=True,
-        )
-        if cfg.causal:
-            y = y[:, :, 0, :, :]
+            k_s = jnp.broadcast_to(k_s[:, None], (x.shape[0], x.shape[1], *k_s.shape[1:]))
+            v_s = jnp.broadcast_to(v_s[:, None], (x.shape[0], x.shape[1], *v_s.shape[1:]))
+            y = _slot_dot_product_attention(q, k_s, v_s)
         y = self.out_proj(self._merge_heads(y))
         if not collect_stats:
             return y
