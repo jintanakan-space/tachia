@@ -40,8 +40,12 @@ def base_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
         str(args.steps),
         "--batch-size",
         str(args.batch_size),
+        "--gradient-accumulation-steps",
+        str(args.gradient_accumulation_steps),
         "--learning-rate",
         str(args.learning_rate),
+        "--weight-decay",
+        str(args.weight_decay),
         "--warmup-ratio",
         str(args.warmup_ratio),
         "--logging-steps",
@@ -62,6 +66,8 @@ def base_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
     command.extend(["--hf-split", args.hf_split])
     if args.hf_streaming:
         command.append("--hf-streaming")
+    if not args.remat:
+        command.append("--no-remat")
     if args.token_cache is not None:
         command.extend(["--token-cache", str(args.token_cache)])
     if args.text_field is not None:
@@ -74,6 +80,18 @@ def base_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
         command.append("--no-shuffle-offsets")
     if args.sharding != "no":
         command.extend(["--sharding", str(args.sharding)])
+    command.extend(
+        [
+            "--optimizer",
+            args.optimizer,
+            "--galore-rank",
+            str(args.galore_rank),
+            "--galore-update-proj-gap",
+            str(args.galore_update_proj_gap),
+            "--galore-scale",
+            str(args.galore_scale),
+        ]
+    )
     return command
 
 
@@ -169,15 +187,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-examples", type=int, default=None)
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--steps", type=int, default=5_000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--logging-steps", type=int, default=50)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-root", default="./output/tpu_lm")
     parser.add_argument("--shuffle-offsets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--optimizer", default="galore_adamw")
+    parser.add_argument("--galore-rank", type=int, default=128)
+    parser.add_argument("--galore-update-proj-gap", type=int, default=200)
+    parser.add_argument("--galore-scale", type=float, default=1.0)
 
     parser.add_argument("--base-slots", type=int, default=128)
     parser.add_argument("--base-temperature", type=float, default=4.0)

@@ -206,7 +206,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selector-temperature", type=float, default=4.0)
     parser.add_argument("--selector-mode", choices=["sigmoid", "softmax"], default="sigmoid")
     parser.add_argument("--steps", type=int, default=5_000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
     parser.add_argument("--logging-steps", type=int, default=50)
@@ -215,6 +216,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="./output/tpu_lm")
     parser.add_argument("--shuffle-offsets", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sharding", choices=["ddp", "no"], default="no")
+    parser.add_argument("--remat", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--optimizer", default="galore_adamw")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--galore-rank", type=int, default=128)
+    parser.add_argument("--galore-update-proj-gap", type=int, default=200)
+    parser.add_argument("--galore-scale", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -267,7 +274,9 @@ def main() -> None:
                     "selector_temperature": args.selector_temperature,
                     "sequence_length": args.sequence_length,
                     "batch_size": args.batch_size,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
                     "steps": args.steps,
+                    "optimizer": args.optimizer,
                 },
             },
             sort_keys=True,
@@ -280,12 +289,21 @@ def main() -> None:
         train_dataset=dataset,
         config=TrainerConfig(
             batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_steps=args.steps,
             logging_steps=args.logging_steps,
+            optimizer=args.optimizer,
+            optimizer_kwargs={
+                "galore_r": args.galore_rank,
+                "galore_update_proj_gap": args.galore_update_proj_gap,
+                "galore_scale": args.galore_scale,
+            },
             learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
             warmup_ratio=args.warmup_ratio,
             output_dir=args.output_dir,
             num_workers=args.num_workers,
+            remat=args.remat,
             sharding="ddp" if args.sharding == "ddp" else None,
         ),
     )

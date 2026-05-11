@@ -39,7 +39,8 @@ uv run python experiments-tpu/run_stage.py \
   --token-cache /kaggle/working/tachia_tokens.npy \
   --sequence-length 512 \
   --steps 5000 \
-  --batch-size 32
+  --batch-size 1 \
+  --gradient-accumulation-steps 32
 ```
 
 Default model-size candidates, estimated with the local vocab size and tied embeddings:
@@ -69,7 +70,8 @@ uv run python experiments-tpu/run_stage.py \
   --slots 64 128 256 512 \
   --sequence-length 512 \
   --steps 5000 \
-  --batch-size 32
+  --batch-size 1 \
+  --gradient-accumulation-steps 32
 ```
 
 Choose `S` using validation loss, training speed, and selector metrics.
@@ -94,7 +96,18 @@ uv run python experiments-tpu/run_stage.py \
   --temperatures 2 4 8 16 \
   --sequence-length 512 \
   --steps 5000 \
-  --batch-size 32
+  --batch-size 1 \
+  --gradient-accumulation-steps 32
 ```
 
 Avoid `T=32` until lower temperatures are clearly too diffuse.
+
+## Memory Defaults
+
+The scripts default to GaLore AdamW and rematerialization:
+
+```bash
+--optimizer galore_adamw --galore-rank 128 --galore-update-proj-gap 200 --remat
+```
+
+GaLore reduces optimizer-state memory. It does not reduce selector activation memory, so keep per-device `--batch-size` small and use `--gradient-accumulation-steps` for effective batch size.
