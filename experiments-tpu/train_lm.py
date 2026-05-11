@@ -214,6 +214,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="./output/tpu_lm")
     parser.add_argument("--shuffle-offsets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sharding", choices=["ddp", "no"], default="no")
     return parser.parse_args()
 
 
@@ -285,7 +286,7 @@ def main() -> None:
             warmup_ratio=args.warmup_ratio,
             output_dir=args.output_dir,
             num_workers=args.num_workers,
-            sharding=None,
+            sharding="ddp" if args.sharding == "ddp" else None,
         ),
     )
     trainer.train()
